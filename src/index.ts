@@ -1,3 +1,7 @@
+interface Env {
+	FEEDBACK_KV: KVNamespace;
+}
+
 interface FeedbackItem {
 	id: string;
 	source: 'support' | 'github' | 'community' | 'twitter';
@@ -154,6 +158,29 @@ function calculatePriorityScore(item: Omit<FeedbackItem, 'priorityScore'>): numb
 	return Math.min(100, Math.max(0, score));
 }
 
+async function loadFeedbackItems(env: Env): Promise<FeedbackItem[]> {
+	try {
+		const raw = await env.FEEDBACK_KV.get("feedback_items");
+		if (raw) {
+			const parsed = JSON.parse(raw) as FeedbackItem[];
+			if (Array.isArray(parsed) && parsed.length > 0) {
+				return parsed;
+			}
+		}
+	} catch (error) {
+		console.error('Failed to load feedback from KV:', error);
+	}
+	return mockFeedback;
+}
+
+async function cacheDigest(env: Env, digest: Digest): Promise<void> {
+	try {
+		await env.FEEDBACK_KV.put("latest_digest", JSON.stringify(digest));
+	} catch (error) {
+		console.error('Failed to cache digest to KV:', error);
+	}
+}
+
 function generateDigest(filteredFeedback: FeedbackItem[]): Digest {
 	const total = filteredFeedback.length;
 	
@@ -217,6 +244,9 @@ function generateHTML(digest: Digest, currentFilters: { sentiment?: string; them
 		.container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
 		.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
 		h1 { color: #333; margin: 0; }
+		.header-actions { display: flex; gap: 10px; align-items: center; }
+		.seed-btn { background: #10b981; color: white; padding: 10px 20px; border-radius: 6px; border: none; text-decoration: none; font-weight: 500; cursor: pointer; font-size: 14px; }
+		.seed-btn:hover { background: #059669; }
 		.view-api-btn { background: #3b82f6; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: 500; }
 		.view-api-btn:hover { background: #2563eb; }
 		.last-updated { color: #666; margin-bottom: 20px; font-size: 14px; }
@@ -259,7 +289,12 @@ function generateHTML(digest: Digest, currentFilters: { sentiment?: string; them
 	<div class="container">
 		<div class="header">
 			<h1>Feedback Triage Digest</h1>
-			<a href="${apiLink}" class="view-api-btn">View JSON API</a>
+			<div class="header-actions">
+				<form method="POST" action="/seed" style="display: inline;">
+					<button type="submit" class="seed-btn">Seed KV (demo)</button>
+				</form>
+				<a href="${apiLink}" class="view-api-btn">View JSON API</a>
+			</div>
 		</div>
 		<div class="last-updated">Last updated: ${new Date(digest.generatedAt).toLocaleString()}</div>
 		
@@ -287,21 +322,6 @@ function generateHTML(digest: Digest, currentFilters: { sentiment?: string; them
 			</ul>
 		</div>
 		` : ''}
-
-		<div class="overview">
-			<a href="/ui?sentiment=positive${currentFilters.theme ? '&theme=' + currentFilters.theme : ''}" class="tile positive">
-				<span class="count">${digest.sentimentBreakdown.Positive}</span>
-				Positive
-			</a>
-			<a href="/ui?sentiment=neutral${currentFilters.theme ? '&theme=' + currentFilters.theme : ''}" class="tile neutral">
-				<span class="count">${digest.sentimentBreakdown.Neutral}</span>
-				Neutral
-			</a>
-			<a href="/ui?sentiment=negative${currentFilters.theme ? '&theme=' + currentFilters.theme : ''}" class="tile negative">
-				<span class="count">${digest.sentimentBreakdown.Negative}</span>
-				Negative
-			</a>
-		</div>
 
 		<div class="section">
 			<h2>Top Themes (${digest.topThemes.length})</h2>
@@ -342,6 +362,11 @@ function generateHTML(digest: Digest, currentFilters: { sentiment?: string; them
 }
 
 function generateAPIPage(digest: Digest, currentFilters: { sentiment?: string; theme?: string }): string {
+	const filterParams = new URLSearchParams();
+	if (currentFilters.sentiment) filterParams.set('sentiment', currentFilters.sentiment);
+	if (currentFilters.theme) filterParams.set('theme', currentFilters.theme);
+	const filterString = filterParams.toString();
+
 	return `
 <!DOCTYPE html>
 <html lang="en">
@@ -354,8 +379,11 @@ function generateAPIPage(digest: Digest, currentFilters: { sentiment?: string; t
 		.container { max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
 		.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
 		h1 { color: #333; margin: 0; }
+		.header-actions { display: flex; gap: 10px; align-items: center; }
 		.back-btn { background: #6b7280; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: 500; }
 		.back-btn:hover { background: #4b5563; }
+		.raw-btn { background: #8b5cf6; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: 500; }
+		.raw-btn:hover { background: #7c3aed; }
 		pre { background: #f8f9fa; padding: 20px; border-radius: 6px; overflow-x: auto; border: 1px solid #e5e7eb; font-size: 14px; line-height: 1.5; }
 	</style>
 </head>
@@ -363,9 +391,10 @@ function generateAPIPage(digest: Digest, currentFilters: { sentiment?: string; t
 	<div class="container">
 		<div class="header">
 			<h1>Feedback Triage Digest API (JSON)</h1>
-			<a href="/ui${currentFilters.sentiment || currentFilters.theme ? '?' + new URLSearchParams(
-				Object.fromEntries(Object.entries(currentFilters).filter(([_, v]) => v))
-			).toString() : ''}" class="back-btn">Back to Dashboard</a>
+			<div class="header-actions">
+				<a href="/digest${filterString ? '?' + filterString : ''}" class="raw-btn">View raw JSON</a>
+				<a href="/ui${filterString ? '?' + filterString : ''}" class="back-btn">Back to dashboard</a>
+			</div>
 		</div>
 		<pre>${JSON.stringify(digest, null, 2)}</pre>
 	</div>
@@ -374,10 +403,10 @@ function generateAPIPage(digest: Digest, currentFilters: { sentiment?: string; t
 }
 
 export default {
-	async fetch(request, env, ctx): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		
-		if (request.method !== 'GET') {
+		if (request.method !== 'GET' && request.method !== 'POST') {
 			return new Response('Method Not Allowed', { status: 405 });
 		}
 
@@ -385,10 +414,32 @@ export default {
 			return Response.redirect(`${url.origin}/ui`, 302);
 		}
 
+		if (url.pathname === '/seed' && request.method === 'POST') {
+			try {
+				await env.FEEDBACK_KV.put("feedback_items", JSON.stringify(mockFeedback));
+				return new Response(JSON.stringify({ 
+					ok: true, 
+					message: "Seeded KV with mock feedback", 
+					count: mockFeedback.length 
+				}), {
+					headers: { 'Content-Type': 'application/json' }
+				});
+			} catch (error) {
+				return new Response(JSON.stringify({ 
+					ok: false, 
+					message: "Failed to seed KV" 
+				}), { 
+					status: 500,
+					headers: { 'Content-Type': 'application/json' }
+				});
+			}
+		}
+
 		const sentimentParam = url.searchParams.get('sentiment')?.toLowerCase();
 		const themeParam = url.searchParams.get('theme');
 
-		let filteredFeedback = mockFeedback.filter(item => {
+		const feedbackItems = await loadFeedbackItems(env);
+		let filteredFeedback = feedbackItems.filter(item => {
 			if (sentimentParam && item.sentiment.toLowerCase() !== sentimentParam) {
 				return false;
 			}
@@ -400,6 +451,8 @@ export default {
 
 		const digest = generateDigest(filteredFeedback);
 		const currentFilters = { sentiment: sentimentParam || undefined, theme: themeParam || undefined };
+
+		cacheDigest(env, digest);
 
 		if (url.pathname === '/digest') {
 			return new Response(JSON.stringify(digest, null, 2), {
