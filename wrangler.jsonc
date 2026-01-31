@@ -15,7 +15,10 @@
 			"binding": "FEEDBACK_KV",
 			"id": "e96449c0c3254b56bfe2bfe13cd737aa"
 		}
-	]
+	],
+	"ai": {
+		"binding": "AI"
+	}
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement

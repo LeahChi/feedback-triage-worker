@@ -1,5 +1,6 @@
 interface Env {
 	FEEDBACK_KV: KVNamespace;
+	AI: any;
 }
 
 interface FeedbackItem {
@@ -26,6 +27,7 @@ interface Digest {
 	}>;
 	needsAttention: FeedbackItem[];
 	pmSummary: string;
+	summarySource: 'ai' | 'rule-based';
 }
 
 const mockFeedback: FeedbackItem[] = [
@@ -181,7 +183,50 @@ async function cacheDigest(env: Env, digest: Digest): Promise<void> {
 	}
 }
 
-function generateDigest(filteredFeedback: FeedbackItem[]): Digest {
+async function generateAiSummary(env: Env, digestData: {
+	sentimentBreakdown: { Positive: number; Neutral: number; Negative: number };
+	topThemes: Array<{ theme: string; count: number }>;
+	needsAttention: FeedbackItem[];
+}): Promise<{ summary: string; source: 'ai' | 'rule-based' }> {
+	try {
+		const prompt = `As a PM, write a 2-3 sentence summary for this feedback digest:
+
+Sentiment: Positive=${digestData.sentimentBreakdown.Positive}, Neutral=${digestData.sentimentBreakdown.Neutral}, Negative=${digestData.sentimentBreakdown.Negative}
+
+Top themes: ${digestData.topThemes.slice(0, 3).map(t => `${t.theme} (${t.count})`).join(', ')}
+
+Top priority items: ${digestData.needsAttention.slice(0, 3).map(item => `"${item.text}" (${item.theme}, priority ${item.priorityScore})`).join('; ')}
+
+Focus on: overall sentiment, key themes, and suggested next action. Keep it concise and actionable.`;
+
+		const response = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+			messages: [{ role: 'user', content: prompt }],
+			temperature: 0.2,
+			max_tokens: 150
+		});
+
+		const aiSummary = response.response?.trim();
+		if (aiSummary && aiSummary.length > 20) {
+			return { summary: aiSummary, source: 'ai' };
+		}
+	} catch (error) {
+		console.error('AI summary generation failed:', error);
+	}
+
+	// Fallback to rule-based summary
+	const total = digestData.sentimentBreakdown.Positive + digestData.sentimentBreakdown.Neutral + digestData.sentimentBreakdown.Negative;
+	const negativeCount = digestData.sentimentBreakdown.Negative;
+	const highUrgencyCount = digestData.needsAttention.filter(item => item.urgency === 'High').length;
+	const topTheme = digestData.topThemes[0]?.theme || 'N/A';
+
+	const ruleBasedSummary = negativeCount > total * 0.4 
+		? `Critical issues need immediate attention: ${negativeCount} negative feedback items primarily around ${topTheme}. ${highUrgencyCount} high-urgency items require immediate action to prevent customer churn.`
+		: `Feedback sentiment is generally stable with ${topTheme} as the primary theme. Focus on addressing ${digestData.needsAttention.length} high-priority items to improve overall satisfaction.`;
+
+	return { summary: ruleBasedSummary, source: 'rule-based' };
+}
+
+async function generateDigest(filteredFeedback: FeedbackItem[], env: Env): Promise<Digest> {
 	const total = filteredFeedback.length;
 	
 	const sentimentBreakdown = filteredFeedback.reduce((acc, item) => {
@@ -204,13 +249,12 @@ function generateDigest(filteredFeedback: FeedbackItem[]): Digest {
 		.sort((a, b) => b.priorityScore - a.priorityScore)
 		.slice(0, 5);
 
-	const negativeCount = sentimentBreakdown.Negative;
-	const highUrgencyCount = filteredFeedback.filter(item => item.urgency === 'High').length;
-	const topTheme = topThemes[0]?.theme || 'N/A';
-
-	const pmSummary = negativeCount > total * 0.4 
-		? `Critical issues need immediate attention: ${negativeCount} negative feedback items primarily around ${topTheme}. ${highUrgencyCount} high-urgency items require immediate action to prevent customer churn.`
-		: `Feedback sentiment is generally stable with ${topTheme} as the primary theme. Focus on addressing ${needsAttention.length} high-priority items to improve overall satisfaction.`;
+	// Generate AI summary with fallback
+	const { summary: pmSummary, source: summarySource } = await generateAiSummary(env, {
+		sentimentBreakdown,
+		topThemes,
+		needsAttention
+	});
 
 	return {
 		generatedAt: new Date().toISOString(),
@@ -218,7 +262,8 @@ function generateDigest(filteredFeedback: FeedbackItem[]): Digest {
 		sentimentBreakdown,
 		topThemes,
 		needsAttention,
-		pmSummary
+		pmSummary,
+		summarySource
 	};
 }
 
@@ -277,6 +322,7 @@ function generateHTML(digest: Digest, currentFilters: { sentiment?: string; them
 		.need-text { font-weight: 500; margin-bottom: 8px; color: #333; }
 		.need-meta { font-size: 12px; color: #666; margin-bottom: 5px; }
 		.summary { background: #f0f9ff; padding: 20px; border-radius: 6px; border-left: 4px solid #3b82f6; }
+		.summary-source { font-size: 12px; color: #6b7280; margin-top: 10px; font-style: italic; }
 		.sentiment-positive { color: #22c55e; font-weight: 500; }
 		.sentiment-neutral { color: #f59e0b; font-weight: 500; }
 		.sentiment-negative { color: #ef4444; font-weight: 500; }
@@ -323,6 +369,21 @@ function generateHTML(digest: Digest, currentFilters: { sentiment?: string; them
 		</div>
 		` : ''}
 
+		<div class="overview">
+			<a href="/ui?sentiment=positive${currentFilters.theme ? '&theme=' + currentFilters.theme : ''}" class="tile positive">
+				<span class="count">${digest.sentimentBreakdown.Positive}</span>
+				Positive
+			</a>
+			<a href="/ui?sentiment=neutral${currentFilters.theme ? '&theme=' + currentFilters.theme : ''}" class="tile neutral">
+				<span class="count">${digest.sentimentBreakdown.Neutral}</span>
+				Neutral
+			</a>
+			<a href="/ui?sentiment=negative${currentFilters.theme ? '&theme=' + currentFilters.theme : ''}" class="tile negative">
+				<span class="count">${digest.sentimentBreakdown.Negative}</span>
+				Negative
+			</a>
+		</div>
+
 		<div class="section">
 			<h2>Top Themes (${digest.topThemes.length})</h2>
 			<ul class="themes">
@@ -355,6 +416,7 @@ function generateHTML(digest: Digest, currentFilters: { sentiment?: string; them
 			<div class="summary">
 				${digest.pmSummary}
 			</div>
+			<div class="summary-source">Summary source: ${digest.summarySource === 'ai' ? 'AI' : 'Rule-based (fallback)'}</div>
 		</div>
 	</div>
 </body>
@@ -384,6 +446,7 @@ function generateAPIPage(digest: Digest, currentFilters: { sentiment?: string; t
 		.back-btn:hover { background: #4b5563; }
 		.raw-btn { background: #8b5cf6; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none; font-weight: 500; }
 		.raw-btn:hover { background: #7c3aed; }
+		.summary-source { font-size: 12px; color: #6b7280; margin-top: 10px; font-style: italic; }
 		pre { background: #f8f9fa; padding: 20px; border-radius: 6px; overflow-x: auto; border: 1px solid #e5e7eb; font-size: 14px; line-height: 1.5; }
 	</style>
 </head>
@@ -396,6 +459,7 @@ function generateAPIPage(digest: Digest, currentFilters: { sentiment?: string; t
 				<a href="/ui${filterString ? '?' + filterString : ''}" class="back-btn">Back to dashboard</a>
 			</div>
 		</div>
+		<div class="summary-source">Summary source: ${digest.summarySource === 'ai' ? 'AI' : 'Rule-based (fallback)'}</div>
 		<pre>${JSON.stringify(digest, null, 2)}</pre>
 	</div>
 </body>
@@ -449,10 +513,10 @@ export default {
 			return true;
 		});
 
-		const digest = generateDigest(filteredFeedback);
+		const digest = await generateDigest(filteredFeedback, env);
 		const currentFilters = { sentiment: sentimentParam || undefined, theme: themeParam || undefined };
 
-		cacheDigest(env, digest);
+		await cacheDigest(env, digest);
 
 		if (url.pathname === '/digest') {
 			return new Response(JSON.stringify(digest, null, 2), {
